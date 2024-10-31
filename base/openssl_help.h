@@ -269,21 +269,20 @@ public:
 	}
 
 	[[nodiscard]] bool isPrime(const Context &context = Context()) const {
-		if (failed() || !_data) {
-			return false;
-		}
-		constexpr auto kMillerRabinIterationCount = 64;
-		const auto result = BN_is_prime_ex(
-			raw(),
-			kMillerRabinIterationCount,
-			context.raw(),
-			nullptr);
-		if (result == 1) {
-			return true;
-		} else if (result != 0) {
-			_failed = true;
-		}
-		return false;
+    		if (failed() || !_data) {
+        		return false;
+    		}
+    		// constexpr auto kMillerRabinIterationCount = 64;
+    		const auto result = BN_check_prime(raw(), nullptr);
+
+    		if (result == 1) {
+    		    return true; 
+    		} else if (result == 0) {
+    		    return false; 
+    		} else {
+    		    _failed = true; 
+    		}
+   		return false; 
 	}
 
 	BigNum &subWord(unsigned int word) {
