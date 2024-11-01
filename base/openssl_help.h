@@ -5,6 +5,8 @@
 // https://github.com/desktop-app/legal/blob/master/LEGAL
 //
 #pragma once
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
 
 #include "base/bytes.h"
 #include "base/algorithm.h"
@@ -630,3 +632,5 @@ inline bytes::vector HmacSha256(
 }
 
 } // namespace openssl
+
+#pragma GCC diagnostic pop
