@@ -273,7 +273,11 @@ public:
         		return false;
     		}
     		// constexpr auto kMillerRabinIterationCount = 64;
-    		const auto result = BN_check_prime(raw());
+    		const auto result = BN_check_prime(
+        		raw(),
+        		context.raw(),
+        		nullptr
+		);
 
     		if (result == 1) {
     		    return true; 
