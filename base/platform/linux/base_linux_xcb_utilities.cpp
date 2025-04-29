@@ -8,7 +8,9 @@
 
 #include "base/qt/qt_common_adapters.h"
 
+#include <QtCore/QAbstractEventDispatcher>
 #include <QtCore/QAbstractNativeEventFilter>
+#include <QtCore/QSocketNotifier>
 #include <QtGui/QGuiApplication>
 
 #if QT_VERSION < QT_VERSION_CHECK(6, 2, 0)
@@ -18,41 +20,11 @@
 namespace base::Platform::XCB {
 namespace {
 
-std::weak_ptr<CustomConnection> GlobalCustomConnection;
-
-class TimestampGetter : public QAbstractNativeEventFilter {
+class QtEventFilter : public QAbstractNativeEventFilter {
 public:
-	TimestampGetter()
-	: _connection(GetConnectionFromQt())
-	, _window(GetRootWindow(_connection))
-	, _atom(GetAtom(_connection, "_DESKTOP_APP_GET_TIMESTAMP")) {
-		if (!_connection) {
-			return;
-		}
-
+	QtEventFilter(Fn<void(xcb_generic_event_t*)> handler)
+	: _handler(handler) {
 		QCoreApplication::instance()->installNativeEventFilter(this);
-	}
-
-	xcb_timestamp_t get() {
-		if (!_connection) {
-			return _timestamp;
-		}
-
-		free(
-			xcb_request_check(
-				_connection,
-				xcb_change_property_checked(
-					_connection,
-					XCB_PROP_MODE_REPLACE,
-					_window,
-					_atom,
-					XCB_ATOM_INTEGER,
-					32,
-					0,
-					nullptr)));
-
-		_loop.exec();
-		return _timestamp;
 	}
 
 private:
@@ -60,51 +32,24 @@ private:
 			const QByteArray &eventType,
 			void *message,
 			native_event_filter_result *result) override {
-		const auto guard = gsl::finally([&] {
-			if (xcb_connection_has_error(_connection)) {
-				_loop.quit();
-			}
-
-			if (_loop.isRunning()) {
-				free(
-					xcb_get_input_focus_reply(
-						_connection,
-						xcb_get_input_focus(_connection),
-						nullptr));
-			}
-		});
-
-		const auto event = reinterpret_cast<xcb_generic_event_t*>(message);
-		if ((event->response_type & ~0x80) != XCB_PROPERTY_NOTIFY) {
-			return false;
-		}
-
-		const auto pn = reinterpret_cast<xcb_property_notify_event_t*>(event);
-		if (pn->window != _window || pn->atom != _atom) {
-			return false;
-		}
-
-		_timestamp = pn->time;
-		_loop.quit();
+		_handler(reinterpret_cast<xcb_generic_event_t*>(message));
 		return false;
 	}
 
-	QEventLoop _loop;
-	xcb_connection_t *_connection = nullptr;
-	xcb_window_t _window = XCB_NONE;
-	xcb_atom_t _atom = XCB_NONE;
-	xcb_timestamp_t _timestamp = XCB_CURRENT_TIME;
+	Fn<void(xcb_generic_event_t*)> _handler;
 };
 
 } // namespace
 
-std::shared_ptr<CustomConnection> SharedConnection() {
-	auto result = GlobalCustomConnection.lock();
+SharedConnection::SharedConnection()
+: std::shared_ptr<CustomConnection>([] {
+	static std::weak_ptr<CustomConnection> Weak;
+	auto result = Weak.lock();
 	if (!result) {
-		GlobalCustomConnection = result = std::make_shared<CustomConnection>();
+		Weak = result = std::make_shared<CustomConnection>();
 	}
 	return result;
-}
+}()) {}
 
 xcb_connection_t *GetConnectionFromQt() {
 #if defined QT_FEATURE_xcb && QT_CONFIG(xcb)
@@ -129,8 +74,166 @@ xcb_connection_t *GetConnectionFromQt() {
 #endif // !xcb
 }
 
-xcb_timestamp_t GetTimestamp() {
-	return TimestampGetter().get();
+rpl::lifetime InstallEventHandler(
+		xcb_connection_t *connection,
+		Fn<void(xcb_generic_event_t*)> handler) {
+	if (!connection || xcb_connection_has_error(connection)) {
+		return rpl::lifetime();
+	}
+
+	static base::flat_map<
+		xcb_connection_t*,
+		std::pair<
+			std::variant<
+				v::null_t,
+				std::unique_ptr<QSocketNotifier>,
+				std::unique_ptr<QtEventFilter>
+			>,
+			std::vector<std::unique_ptr<Fn<void(xcb_generic_event_t*)>>>
+		>
+	> EventHandlers;
+
+	auto it = EventHandlers.find(connection);
+	if (it == EventHandlers.cend()) {
+		it = EventHandlers.emplace(connection).first;
+		if (connection == GetConnectionFromQt()) {
+			it->second.first = std::make_unique<QtEventFilter>([=](
+					xcb_generic_event_t *event) {
+				const auto it = EventHandlers.find(connection);
+				for (const auto &handler : it->second.second) {
+					(*handler)(event);
+				}
+			});
+		} else {
+			it->second.first = std::make_unique<QSocketNotifier>(
+				xcb_get_file_descriptor(connection),
+				QSocketNotifier::Read);
+
+			auto &notifier = *v::get<std::unique_ptr<QSocketNotifier>>(
+				it->second.first);
+
+			QObject::connect(
+				QCoreApplication::eventDispatcher(),
+				&QAbstractEventDispatcher::aboutToBlock,
+				&notifier,
+				[=] {
+					const auto it = EventHandlers.find(connection);
+					EventPointer<xcb_generic_event_t> event;
+					while (!xcb_connection_has_error(connection)
+							&& (event = MakeEventPointer(
+								xcb_poll_for_event(connection)))) {
+						for (const auto &handler : it->second.second) {
+							(*handler)(event.get());
+						}
+					}
+					// Let handlers handle the error
+					if (xcb_connection_has_error(connection)) {
+						for (const auto &handler : it->second.second) {
+							(*handler)(nullptr);
+						}
+						it->second.first = v::null;
+					}
+				});
+
+			notifier.setEnabled(true);
+		}
+	}
+
+	const auto ptr = it->second.second.emplace_back(new Fn(handler)).get();
+	return rpl::lifetime([=] {
+		const auto it = EventHandlers.find(connection);
+		it->second.second.erase(
+			ranges::remove(
+				it->second.second,
+				ptr,
+				&decltype(it->second.second)::value_type::get),
+			it->second.second.end());
+		if (it->second.second.empty()) {
+			EventHandlers.remove(connection);
+		}
+	});
+}
+
+xcb_timestamp_t GetTimestamp(xcb_connection_t *connection) {
+	if (!connection || xcb_connection_has_error(connection)) {
+		return XCB_CURRENT_TIME;
+	}
+
+	const auto window = GetRootWindow(connection);
+	if (!window) {
+		return XCB_CURRENT_TIME;
+	}
+
+	const auto atom = GetAtom(connection, "_DESKTOP_APP_GET_TIMESTAMP");
+	if (!atom) {
+		return XCB_CURRENT_TIME;
+	}
+
+	const auto eventMask = ChangeWindowEventMask(
+		connection,
+		window,
+		XCB_EVENT_MASK_PROPERTY_CHANGE);
+
+	if (!eventMask) {
+		return XCB_CURRENT_TIME;
+	}
+
+	QEventLoop loop;
+	xcb_timestamp_t timestamp = XCB_CURRENT_TIME;
+	const auto lifetime = InstallEventHandler(
+		connection,
+		[&](xcb_generic_event_t *event) {
+			if (!event) {
+				loop.quit();
+				return;
+			}
+
+			const auto guard = gsl::finally([&] {
+				free(
+					xcb_get_input_focus_reply(
+						connection,
+						xcb_get_input_focus(connection),
+						nullptr));
+			});
+
+			if ((event->response_type & ~0x80) != XCB_PROPERTY_NOTIFY) {
+				return;
+			}
+
+			const auto pn = reinterpret_cast<xcb_property_notify_event_t*>(
+				event);
+
+			if (pn->window != window || pn->atom != atom) {
+				return;
+			}
+
+			timestamp = pn->time;
+			loop.quit();
+		});
+
+	if (!lifetime) {
+		return XCB_CURRENT_TIME;
+	}
+
+	const auto error = MakeErrorPointer(
+		xcb_request_check(
+			connection,
+			xcb_change_property_checked(
+				connection,
+				XCB_PROP_MODE_REPLACE,
+				window,
+				atom,
+				XCB_ATOM_INTEGER,
+				32,
+				0,
+				nullptr)));
+
+	if (error) {
+		return XCB_CURRENT_TIME;
+	}
+
+	loop.exec();
+	return timestamp;
 }
 
 xcb_window_t GetRootWindow(xcb_connection_t *connection) {
@@ -301,6 +404,82 @@ bool IsSupportedByWM(xcb_connection_t *connection, const QString &atomName) {
 	}
 
 	return ranges::contains(GetWMSupported(connection, root), atom);
+}
+
+rpl::lifetime ChangeWindowEventMask(
+		xcb_connection_t *connection,
+		xcb_window_t window,
+		uint mask,
+		ChangeWindowEventMaskMode mode,
+		bool revert) {
+	using Mode = ChangeWindowEventMaskMode;
+	if (!connection || xcb_connection_has_error(connection)) {
+		return rpl::lifetime();
+	}
+
+	const auto windowAttribsCookie = xcb_get_window_attributes(
+		connection,
+		window);
+
+	const auto windowAttribs = MakeReplyPointer(
+		xcb_get_window_attributes_reply(
+			connection,
+			windowAttribsCookie,
+			nullptr));
+
+	const uint oldMask = windowAttribs ? windowAttribs->your_event_mask : 0;
+
+	if ((mode == Mode::Add) && (oldMask & mask)) {
+		return rpl::lifetime([] {});
+	} else if ((mode == Mode::Remove) && !(oldMask & mask)) {
+		return rpl::lifetime([] {});
+	} else if (oldMask == mask) {
+		return rpl::lifetime([] {});
+	}
+
+	const uint value[] = {
+		mode == Mode::Add
+			? oldMask | mask
+			: mode == Mode::Remove
+			? oldMask & ~mask
+			: mask
+	};
+
+	const auto error = MakeErrorPointer(
+		xcb_request_check(
+			connection,
+			xcb_change_window_attributes_checked(
+				connection,
+				window,
+				XCB_CW_EVENT_MASK,
+				value)));
+
+	if (error) {
+		return rpl::lifetime();
+	}
+
+	if (!revert) {
+		return rpl::lifetime([] {});
+	}
+
+	return rpl::lifetime([=] {
+		if (xcb_connection_has_error(connection)) {
+			return;
+		}
+
+		const uint value[] = {
+			oldMask
+		};
+
+		free(
+			xcb_request_check(
+				connection,
+				xcb_change_window_attributes_checked(
+					connection,
+					window,
+					XCB_CW_EVENT_MASK,
+					value)));
+	});
 }
 
 } // namespace base::Platform::XCB

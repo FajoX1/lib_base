@@ -6,8 +6,6 @@
 //
 #include "base/platform/linux/base_linux_xsettings.h"
 
-#include "base/platform/base_platform_info.h"
-
 #include <QtCore/QByteArray>
 #include <QtCore/QtEndian>
 #include <QtGui/QColor>
@@ -33,24 +31,33 @@ public:
 		this->value = value;
 		this->last_change_serial = last_change_serial;
 		for (const auto &callback : callback_links)
-			callback.func(connection, name, value, callback.handle);
+			(*callback)(connection, name, value);
 	}
 
-	void addCallback(PropertyChangeFunc func, void *handle) {
-		Callback callback = { func, handle };
-		callback_links.push_back(callback);
+	rpl::lifetime addCallback(PropertyChangeFunc func) {
+		const auto handle = Instance();
+		callback_links.push_back(std::make_unique<PropertyChangeFunc>(func));
+		const auto ptr = callback_links.back().get();
+		return rpl::lifetime([=] {
+			(void)handle;
+			callback_links.erase(
+				ranges::remove(
+					callback_links,
+					ptr,
+					&decltype(callback_links)::value_type::get),
+				callback_links.end());
+		});
 	}
 
 	QVariant value;
 	int last_change_serial = -1;
-	std::vector<Callback> callback_links;
+	std::vector<std::unique_ptr<PropertyChangeFunc>> callback_links;
 
 };
 
 class XSettings::Private {
 public:
-	Private()
-	: connection(GetConnectionFromQt()) {
+	Private() {
 	}
 
 	QByteArray getSettings() {
@@ -217,16 +224,20 @@ public:
 
 	}
 
-	xcb_connection_t * const connection = nullptr;
+	const Connection connection;
 	xcb_window_t x_settings_window = XCB_NONE;
-	QMap<QByteArray, PropertyValue> settings;
+	base::flat_map<QByteArray, PropertyValue> settings;
 	bool initialized = false;
+	rpl::lifetime lifetime;
 };
 
 
 XSettings::XSettings()
 : _private(std::make_unique<Private>()) {
 	if (!_private->connection)
+		return;
+
+	if (xcb_connection_has_error(_private->connection))
 		return;
 
 	const auto selection_owner_atom = GetAtom(
@@ -253,20 +264,39 @@ XSettings::XSettings()
 	if (!_private->x_settings_window)
 		return;
 
-	QCoreApplication::instance()->installNativeEventFilter(this);
-	const uint32_t event = XCB_CW_EVENT_MASK;
-	const uint32_t event_mask[] = {
-		XCB_EVENT_MASK_STRUCTURE_NOTIFY | XCB_EVENT_MASK_PROPERTY_CHANGE
-	};
+	auto event_handler = InstallEventHandler(
+		_private->connection,
+		[=](xcb_generic_event_t *event) {
+			if (!event)
+				return;
 
-	free(
-		xcb_request_check(
-			_private->connection,
-			xcb_change_window_attributes_checked(
-				_private->connection,
-				_private->x_settings_window,
-				event,
-				event_mask)));
+			const auto response_type = event->response_type & ~0x80;
+			if (response_type != XCB_PROPERTY_NOTIFY)
+				return;
+
+			const auto pn = reinterpret_cast<xcb_property_notify_event_t*>(
+				event);
+
+			if (pn->window != _private->x_settings_window)
+				return;
+
+			_private->populateSettings(_private->getSettings());
+		});
+
+	if (!event_handler)
+		return;
+
+	_private->lifetime.add(std::move(event_handler));
+
+	auto event_mask = ChangeWindowEventMask(
+		_private->connection,
+		_private->x_settings_window,
+		XCB_EVENT_MASK_STRUCTURE_NOTIFY | XCB_EVENT_MASK_PROPERTY_CHANGE);
+
+	if (!event_mask)
+		return;
+
+	_private->lifetime.add(std::move(event_mask));
 
 	_private->populateSettings(_private->getSettings());
 	_private->initialized = true;
@@ -274,66 +304,29 @@ XSettings::XSettings()
 
 XSettings::~XSettings() = default;
 
-XSettings *XSettings::Instance() {
-	if (!::Platform::IsX11()) return nullptr;
-	static XSettings instance;
-	return &instance;
+std::shared_ptr<XSettings> XSettings::Instance() {
+	static std::weak_ptr<XSettings> Weak;
+	auto result = Weak.lock();
+	if (!result) {
+		Weak = result = std::shared_ptr<XSettings>(
+			new XSettings,
+			[](XSettings *ptr) { delete ptr; });
+	}
+	return result;
 }
 
 bool XSettings::initialized() const {
 	return _private->initialized;
 }
 
-bool XSettings::nativeEventFilter(
-		const QByteArray &eventType,
-		void *message,
-		native_event_filter_result *result) {
-	const auto event = static_cast<xcb_generic_event_t*>(message);
-	const auto response_type = event->response_type & ~0x80;
-	if (response_type != XCB_PROPERTY_NOTIFY)
-		return false;
-
-	const auto pn = reinterpret_cast<xcb_property_notify_event_t*>(event);
-	if (pn->window != _private->x_settings_window)
-		return false;
-
-	_private->populateSettings(_private->getSettings());
-	return false;
-}
-
-void XSettings::registerCallbackForProperty(
+rpl::lifetime XSettings::registerCallbackForProperty(
 		const QByteArray &property,
-		PropertyChangeFunc func,
-		void *handle) {
-	_private->settings[property].addCallback(func,handle);
-}
-
-void XSettings::removeCallbackForHandle(
-		const QByteArray &property,
-		void *handle) {
-	auto &callbacks = _private->settings[property].callback_links;
-
-	auto isCallbackForHandle = [handle](const Callback &cb) {
-		return cb.handle == handle;
-	};
-
-	callbacks.erase(
-		std::remove_if(
-			callbacks.begin(),
-			callbacks.end(),
-			isCallbackForHandle),
-		callbacks.end());
-}
-
-void XSettings::removeCallbackForHandle(void *handle) {
-	for (auto it = _private->settings.cbegin()
-		; it != _private->settings.cend(); ++it) {
-		removeCallbackForHandle(it.key(), handle);
-	}
+		PropertyChangeFunc func) {
+	return _private->settings[property].addCallback(func);
 }
 
 QVariant XSettings::setting(const QByteArray &property) const {
-	return _private->settings.value(property).value;
+	return _private->settings[property].value;
 }
 
 } // namespace base::Platform::XCB
